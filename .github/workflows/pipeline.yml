@@ -1,0 +1,163 @@
+name: Pipeline
+
+on:
+  push:
+    # Se activa en cualquier push, pero el gate filtrará si no hay PR abierto.
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # ==========================================
+  # Job 1: Gate - Validación de PR abierto
+  # ==========================================
+  gate:
+    name: Validar PR Abierto
+    runs-on: ubuntu-latest
+    outputs:
+      has_pr: ${{ steps.check_pr.outputs.has_pr }}
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Verificar si la rama tiene un PR abierto
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Usamos GitHub CLI para listar PRs cuya rama head coincide con la actual y están abiertos
+          PR_BRANCH="${{ github.ref_name }}"
+          PR_COUNT=$(gh pr list --head "$PR_BRANCH" --state open --json number --jq 'length')
+          
+          if [ "$PR_COUNT" -gt 0 ]; then
+            echo "has_pr=true" >> $GITHUB_OUTPUT
+            echo "Se encontró un Pull Request abierto para la rama $PR_BRANCH."
+          else
+            echo "has_pr=false" >> $GITHUB_OUTPUT
+            echo "No hay Pull Request abierto para la rama $PR_BRANCH. El pipeline se detendrá."
+          fi
+
+  # ==========================================
+  # Job 2: Tests - Ejecución de pruebas unitarias
+  # ==========================================
+  test:
+    name: Backend Tests
+    needs: gate
+    if: needs.gate.outputs.has_pr == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar pruebas
+        # Placeholder: Ajustar si el comando de tests es distinto
+        run: npm test
+
+  # ==========================================
+  # Job 3: Build - Generación del artefacto
+  # ==========================================
+  build:
+    name: Backend Build
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar build
+        # Placeholder: Genera la carpeta dist/
+        run: npm run build
+
+      - name: Subir artefacto de construcción
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-dist
+          path: backend/dist/
+          retention-days: 1
+
+  # ==========================================
+  # Job 4: Deploy - Despliegue en AWS EC2
+  # ==========================================
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Descargar artefacto de construcción
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-dist
+          path: dist/
+
+      - name: Configurar credenciales de AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-region: us-east-1 # Placeholder: Ajustar según región de la instancia
+
+      - name: Configurar SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      - name: Desplegar archivos mediante SCP y Reiniciar vía SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_INSTANCE }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          # Configurar el host destino. Si EC2_INSTANCE ya trae el usuario, scp lo manejará.
+          # Usamos StrictHostKeyChecking=accept-new por seguridad.
+          
+          TARGET_DIR="/home/${EC2_USER}/app"
+          
+          echo "Iniciando copia de archivos a ${EC2_HOST}..."
+          
+          # Crear directorio si no existe y copiar archivos
+          ssh -o StrictHostKeyChecking=accept-new ${EC2_USER}@${EC2_HOST} "mkdir -p ${TARGET_DIR}/dist"
+          
+          scp -o StrictHostKeyChecking=accept-new -r dist/* ${EC2_USER}@${EC2_HOST}:${TARGET_DIR}/dist/
+          scp -o StrictHostKeyChecking=accept-new backend/package*.json ${EC2_USER}@${EC2_HOST}:${TARGET_DIR}/
+          
+          echo "Reinstalando dependencias de producción y reiniciando servicio..."
+          ssh -o StrictHostKeyChecking=accept-new ${EC2_USER}@${EC2_HOST} << 'EOF'
+            cd /home/${{ secrets.EC2_USER }}/app
+            npm install --production
+            
+            # Restart logic (Placeholder: pm2, systemd, etc.)
+            if pm2 list | grep -q 'backend-api'; then
+              pm2 restart backend-api
+            else
+              pm2 start dist/index.js --name backend-api
+            fi
+          EOF
